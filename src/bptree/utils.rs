@@ -1,7 +1,4 @@
-use super::types::Slot;
-
-pub type PageId = u64;
-pub type Offset = u16;
+use super::types::{Offset, PageId, Slot};
 
 pub const PAGE_SIZE: usize = 16 * 1024;
 pub const INVALID_PAGE_ID: PageId = 0;

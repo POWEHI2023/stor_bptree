@@ -1,14 +1,12 @@
-pub mod error;
-pub mod types;
-pub mod utils;
-
-use error::{PageDecodeError, PageEncodeError, PageMutationError};
-pub use types::{InternalCell, LeafCell, Page, PageFrame, PageHeader, PageNodeType, RawPage, Slot};
-use utils::{
-    CHECKSUM_OFFSET, PAGE_MAGIC, PAGE_VERSION, checksum, decode_page_id, encode_page_id, read_u16,
-    read_u32, read_u64, validate_layout, validate_slot, write_u16, write_u32, write_u64,
+use super::error::{PageDecodeError, PageEncodeError, PageMutationError};
+use super::types::{Offset, Page, PageHeader, PageId, PageNodeType, RawPage, Slot};
+use super::utils::{
+    CHECKSUM_OFFSET, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, PAGE_VERSION, SLOT_SIZE,
 };
-pub use utils::{INVALID_PAGE_ID, Offset, PAGE_HEADER_SIZE, PAGE_SIZE, PageId, SLOT_SIZE};
+use super::utils::{
+    checksum, decode_page_id, encode_page_id, read_u16, read_u32, read_u64, validate_layout,
+    validate_slot, write_u16, write_u32, write_u64,
+};
 
 impl Page {
     pub fn decode(raw: &RawPage) -> Result<Self, PageDecodeError> {

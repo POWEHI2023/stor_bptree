@@ -1,6 +1,9 @@
 use super::error::PageDecodeError;
-use super::utils::{Offset, PAGE_SIZE, PageId};
+use super::utils::PAGE_SIZE;
 use std::sync::RwLock;
+
+pub type PageId = u64;
+pub type Offset = u16;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
