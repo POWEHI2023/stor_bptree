@@ -1,83 +1,14 @@
 pub mod error;
+pub mod types;
 pub mod utils;
 
 use error::{PageDecodeError, PageEncodeError, PageMutationError};
+pub use types::{InternalCell, LeafCell, Page, PageFrame, PageHeader, PageNodeType, RawPage, Slot};
 use utils::{
-    PAGE_MAGIC, PAGE_VERSION, CHECKSUM_OFFSET, 
-    encode_page_id, decode_page_id, validate_layout, checksum,
-    read_u16, read_u32, read_u64
+    CHECKSUM_OFFSET, PAGE_MAGIC, PAGE_VERSION, checksum, decode_page_id, encode_page_id, read_u16,
+    read_u32, read_u64, validate_layout, validate_slot, write_u16, write_u32, write_u64,
 };
-pub use utils::{
-    PageId, Offset, PAGE_SIZE, 
-    INVALID_PAGE_ID, PAGE_HEADER_SIZE, SLOT_SIZE,
-};
-
-use std::sync::RwLock;
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageNodeType {
-    Internal = 1,
-    Leaf = 2,
-}
-
-impl PageNodeType {
-    fn from_u8(value: u8) -> Result<Self, PageDecodeError> {
-        match value {
-            1 => Ok(Self::Internal),
-            2 => Ok(Self::Leaf),
-            _ => Err(PageDecodeError::InvalidNodeType(value)),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RawPage {
-    pub bytes: [u8; PAGE_SIZE],
-}
-
-impl RawPage {
-    pub fn zeroed() -> Self {
-        Self {
-            bytes: [0; PAGE_SIZE],
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PageHeader {
-    pub page_id: PageId,
-    pub parent_page_id: Option<PageId>,
-
-    pub next_page_id: Option<PageId>, // only used by leaf nodes
-    pub prev_page_id: Option<PageId>, // only used by leaf nodes
-
-    pub node_type: PageNodeType,
-
-    pub key_count: u16,
-
-    /// slot directory grows forward, cell data grows backward.
-    /// total free size eq free_end - free_start
-    pub free_start: Offset, // tail of slot directory
-    pub free_end: Offset,   // start of cell data
-
-    checksum: u32,
-}
-
-/// 4/8/16 Kb page in resistent memory
-/// each page is a bp tree node
-#[derive(Debug, Clone)]
-pub struct Page {
-    pub header: PageHeader,
-
-    /// Page-sized decoded cell arena. Slot offsets index into this buffer.
-    pub data: Vec<u8>,
-    /// slots ordered by key
-    pub slots: Vec<Slot>,
-
-    /// Only used when page node type is `Internal`.
-    pub left_most_child_page_id: Option<PageId>,
-}
+pub use utils::{INVALID_PAGE_ID, Offset, PAGE_HEADER_SIZE, PAGE_SIZE, PageId, SLOT_SIZE};
 
 impl Page {
     pub fn decode(raw: &RawPage) -> Result<Self, PageDecodeError> {
@@ -129,7 +60,7 @@ impl Page {
         }
 
         Ok(Self {
-            header: PageHeader {
+            header: PageHeader::new(
                 page_id,
                 parent_page_id,
                 next_page_id,
@@ -138,8 +69,8 @@ impl Page {
                 key_count,
                 free_start,
                 free_end,
-                checksum: stored_checksum,
-            },
+                stored_checksum,
+            ),
             data: raw.bytes.to_vec(),
             slots,
             left_most_child_page_id,
@@ -197,24 +128,12 @@ impl Page {
         Self::new(page_id, parent_page_id, PageNodeType::Internal, None)
     }
 
-    pub fn is_leaf(&self) -> bool {
-        self.header.node_type == PageNodeType::Leaf
-    }
-
-    pub fn is_internal(&self) -> bool {
-        self.header.node_type == PageNodeType::Internal
+    pub fn page_type(&self) -> PageNodeType {
+        self.header.node_type
     }
 
     pub fn free_space(&self) -> usize {
         (self.header.free_end - self.header.free_start) as usize
-    }
-
-    pub fn key_count(&self) -> usize {
-        self.header.key_count as usize
-    }
-
-    pub fn checksum(&self) -> u32 {
-        self.header.checksum
     }
 
     pub fn set_parent_page_id(&mut self, parent_page_id: Option<PageId>) {
@@ -230,6 +149,7 @@ impl Page {
         self.left_most_child_page_id = page_id;
     }
 
+    /// Get bytes in slot
     pub fn cell_bytes(&self, index: usize) -> Option<&[u8]> {
         let slot = self.slots.get(index)?;
         let start = slot.offset as usize;
@@ -237,6 +157,7 @@ impl Page {
         self.data.get(start..end)
     }
 
+    /// Insert bytes in slot
     pub fn insert_cell_bytes(
         &mut self,
         index: usize,
@@ -286,6 +207,7 @@ impl Page {
         Ok(())
     }
 
+    /// create a new page node
     fn new(
         page_id: PageId,
         parent_page_id: Option<PageId>,
@@ -293,90 +215,52 @@ impl Page {
         left_most_child_page_id: Option<PageId>,
     ) -> Self {
         Self {
-            header: PageHeader {
+            header: PageHeader::new(
                 page_id,
                 parent_page_id,
-                next_page_id: None,
-                prev_page_id: None,
+                None,
+                None,
                 node_type,
-                key_count: 0,
-                free_start: PAGE_HEADER_SIZE as Offset,
-                free_end: PAGE_SIZE as Offset,
-                checksum: 0,
-            },
+                0,
+                PAGE_HEADER_SIZE as Offset,
+                PAGE_SIZE as Offset,
+                0,
+            ),
             data: vec![0; PAGE_SIZE],
             slots: Vec::new(),
             left_most_child_page_id,
         }
     }
 
+    /// validate current page node
     fn validate(&self) -> Result<(), &'static str> {
+        // data size must eq `PAGE_SIZE`
         if self.data.len() != PAGE_SIZE {
             return Err("page data must be PAGE_SIZE bytes");
         }
 
+        // key count must eq slot count
         if self.header.key_count as usize != self.slots.len() {
             return Err("key_count must match slots length");
         }
 
+        // validdate memory layout
         validate_layout(
             self.header.key_count,
             self.header.free_start,
             self.header.free_end,
         )?;
 
+        // just internal page node has left most child
         if self.header.node_type == PageNodeType::Leaf && self.left_most_child_page_id.is_some() {
             return Err("leaf page cannot have left_most_child_page_id");
         }
 
+        // each slot in page also must be valid
         for slot in &self.slots {
             validate_slot(*slot, self.header.free_end)?;
         }
 
         Ok(())
     }
-}
-
-/// slots in page
-/// transfer byte into actual data with type
-#[derive(Debug, Clone, Copy)]
-pub struct Slot {
-    pub offset: Offset,
-    pub len: u16,
-}
-
-pub struct PageFrame {
-    pub page_id: PageId,
-    pub page: RwLock<Page>,
-    pub is_dirty: bool,
-    pub pin_count: usize,
-}
-
-pub struct LeafCell<K, V> {
-    pub key: K,
-    pub value: V,
-}
-
-pub struct InternalCell<K> {
-    pub key: K,
-    pub child_page_id: PageId,
-}
-
-fn validate_slot(slot: Slot, free_end: Offset) -> Result<(), &'static str> {
-    let start = slot.offset as usize;
-    let end = start + slot.len as usize;
-
-    if slot.len == 0 {
-        return Err("slot length cannot be zero");
-    }
-
-    if slot.offset < free_end {
-        return Err("slot offset must be inside the cell data area");
-    }
-
-    if end > PAGE_SIZE {
-        return Err("slot end cannot exceed PAGE_SIZE");
-    }
-
-    Ok(())
 }

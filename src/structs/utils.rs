@@ -1,3 +1,5 @@
+use super::types::Slot;
+
 pub type PageId = u64;
 pub type Offset = u16;
 
@@ -44,6 +46,26 @@ pub fn validate_layout(
     Ok(())
 }
 
+pub fn validate_slot(slot: Slot, free_end: Offset) -> Result<(), &'static str> {
+    let start = slot.offset as usize;
+    let end = start + slot.len as usize;
+
+    if slot.len == 0 {
+        return Err("slot length cannot be zero");
+    }
+
+    if slot.offset < free_end {
+        return Err("slot offset must be inside the cell data area");
+    }
+
+    if end > PAGE_SIZE {
+        return Err("slot end cannot exceed PAGE_SIZE");
+    }
+
+    Ok(())
+}
+
+// calculate chechsum for page
 pub fn checksum(bytes: &[u8; PAGE_SIZE]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
 
