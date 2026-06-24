@@ -1,7 +1,32 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageRuntimeError {
-    IndexOutOfBounds { index: usize, len: usize },
-    VisitDataFailed { offset: usize, len: usize },
+    MissingEnv {
+        key: &'static str,
+    },
+    Io {
+        path: String,
+        source: String,
+    },
+    Yaml {
+        path: String,
+        source: String,
+    },
+    InvalidPath {
+        path: String,
+        reason: String,
+    },
+    InvalidMeta {
+        page_id: Option<u64>,
+        reason: String,
+    },
+    IndexOutOfBounds {
+        index: usize,
+        len: usize,
+    },
+    VisitDataFailed {
+        offset: usize,
+        len: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +55,14 @@ pub enum PageMutationError {
 impl std::fmt::Display for PageRuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingEnv { key } => write!(f, "missing required environment variable {key}"),
+            Self::Io { path, source } => write!(f, "I/O failed for {path}: {source}"),
+            Self::Yaml { path, source } => write!(f, "failed to parse YAML {path}: {source}"),
+            Self::InvalidPath { path, reason } => write!(f, "invalid path {path}: {reason}"),
+            Self::InvalidMeta { page_id, reason } => match page_id {
+                Some(page_id) => write!(f, "invalid page metadata for page {page_id}: {reason}"),
+                None => write!(f, "invalid page metadata: {reason}"),
+            },
             Self::IndexOutOfBounds { index, len } => {
                 write!(f, "cell index {index} is out of bounds for length {len}")
             }

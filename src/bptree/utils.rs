@@ -1,4 +1,8 @@
-use super::page_types::{Offset, PageId, Slot};
+use std::path::{Component, Path, PathBuf};
+use std::{collections::HashMap, fs, io};
+
+use super::error::PageRuntimeError;
+use super::page_types::{Offset, PageId, PageInfo, Slot};
 
 pub const PAGE_SIZE: usize = 16 * 1024;
 pub const INVALID_PAGE_ID: PageId = 0;
@@ -27,8 +31,6 @@ pub const PAGE_CHECKSUM_OFFSET: usize = 54;
 pub const SLOT_SIZE: usize = 4;
 pub const SLOT_CELL_OFFSET_OFFSET: usize = 0;
 pub const SLOT_CELL_LEN_OFFSET: usize = 2;
-
-pub const CHECKSUM_OFFSET: usize = PAGE_CHECKSUM_OFFSET;
 
 pub fn encode_page_id(page_id: Option<PageId>) -> PageId {
     page_id.unwrap_or(INVALID_PAGE_ID)
@@ -134,4 +136,167 @@ pub fn write_u32(bytes: &mut [u8; PAGE_SIZE], offset: usize, value: u32) {
 
 pub fn write_u64(bytes: &mut [u8; PAGE_SIZE], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+pub fn resolve_project_path(path: &str) -> Result<PathBuf, PageRuntimeError> {
+    if path.trim().is_empty() {
+        return Err(PageRuntimeError::InvalidPath {
+            path: path.to_owned(),
+            reason: "path cannot be empty".to_owned(),
+        });
+    }
+
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+    }
+}
+
+pub fn read_to_string(path: &Path) -> Result<String, PageRuntimeError> {
+    fs::read_to_string(path).map_err(|error| io_error(path, error))
+}
+
+pub fn parse_yaml<T>(path: &Path, text: &str) -> Result<T, PageRuntimeError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_yaml::from_str(text).map_err(|error| PageRuntimeError::Yaml {
+        path: path.display().to_string(),
+        source: error.to_string(),
+    })
+}
+
+pub fn ensure_file(path: &Path) -> Result<(), PageRuntimeError> {
+    let metadata = fs::metadata(path).map_err(|error| io_error(path, error))?;
+    if !metadata.is_file() {
+        return Err(PageRuntimeError::InvalidPath {
+            path: path.display().to_string(),
+            reason: "expected a file".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+pub fn ensure_dir(path: &Path) -> Result<(), PageRuntimeError> {
+    let metadata = fs::metadata(path).map_err(|error| io_error(path, error))?;
+    if !metadata.is_dir() {
+        return Err(PageRuntimeError::InvalidPath {
+            path: path.display().to_string(),
+            reason: "expected a directory".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn io_error(path: &Path, error: io::Error) -> PageRuntimeError {
+    PageRuntimeError::Io {
+        path: path.display().to_string(),
+        source: error.to_string(),
+    }
+}
+
+pub fn validate_page_meta(
+    page_meta: &HashMap<PageId, PageInfo>,
+    page_file_dir: &Path,
+) -> Result<(), PageRuntimeError> {
+    let mut ranges_by_file: HashMap<PathBuf, Vec<(u64, u64, PageId)>> = HashMap::new();
+
+    for (page_id, info) in page_meta {
+        if *page_id == 0 {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(*page_id),
+                reason: "page_id cannot be 0".to_owned(),
+            });
+        }
+
+        if info.page_size != PAGE_SIZE {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(*page_id),
+                reason: format!("page_size must be {PAGE_SIZE}, got {}", info.page_size),
+            });
+        }
+
+        validate_file_name(&info.file_name)?;
+
+        let page_file_path = page_file_dir.join(&info.file_name);
+        let metadata =
+            fs::metadata(&page_file_path).map_err(|error| io_error(&page_file_path, error))?;
+        if !metadata.is_file() {
+            return Err(PageRuntimeError::InvalidPath {
+                path: page_file_path.display().to_string(),
+                reason: "expected a page file".to_owned(),
+            });
+        }
+
+        let page_size = info.page_size as u64;
+        let end =
+            info.offset
+                .checked_add(page_size)
+                .ok_or_else(|| PageRuntimeError::InvalidMeta {
+                    page_id: Some(*page_id),
+                    reason: format!(
+                        "offset {} plus page_size {} overflows",
+                        info.offset, page_size
+                    ),
+                })?;
+
+        if end > metadata.len() {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(*page_id),
+                reason: format!(
+                    "range {}..{} exceeds file size {}",
+                    info.offset,
+                    end,
+                    metadata.len()
+                ),
+            });
+        }
+
+        ranges_by_file
+            .entry(page_file_path)
+            .or_default()
+            .push((info.offset, end, *page_id));
+    }
+
+    for ranges in ranges_by_file.values_mut() {
+        ranges.sort_by_key(|(start, _, _)| *start);
+        for pair in ranges.windows(2) {
+            let (_, prev_end, prev_page_id) = pair[0];
+            let (next_start, _, next_page_id) = pair[1];
+            if prev_end > next_start {
+                return Err(PageRuntimeError::InvalidMeta {
+                    page_id: Some(next_page_id),
+                    reason: format!(
+                        "page range overlaps with page {prev_page_id}: previous end {prev_end}, next start {next_start}"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_file_name(file_name: &str) -> Result<(), PageRuntimeError> {
+    let path = Path::new(file_name);
+    let mut components = path.components();
+    let is_plain_file_name = !file_name.is_empty()
+        && !path.is_absolute()
+        && !file_name.contains('/')
+        && !file_name.contains('\\')
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none();
+
+    if is_plain_file_name {
+        Ok(())
+    } else {
+        Err(PageRuntimeError::InvalidPath {
+            path: file_name.to_owned(),
+            reason: "file_name must be a plain file name".to_owned(),
+        })
+    }
 }

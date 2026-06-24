@@ -37,6 +37,14 @@ impl RawPage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageInfo {
+    pub file_name: String,
+    pub offset: u64,
+    pub page_size: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PageHeader {
     pub page_id: PageId,
@@ -58,28 +66,30 @@ pub struct PageHeader {
     checksum: u32,
 }
 
+pub(crate) struct PageHeaderInit {
+    pub page_id: PageId,
+    pub parent_page_id: Option<PageId>,
+    pub next_page_id: Option<PageId>,
+    pub prev_page_id: Option<PageId>,
+    pub node_type: PageNodeType,
+    pub key_count: u16,
+    pub free_start: Offset,
+    pub free_end: Offset,
+    pub checksum: u32,
+}
+
 impl PageHeader {
-    pub fn new(
-        page_id: PageId,
-        parent_page_id: Option<PageId>,
-        next_page_id: Option<PageId>,
-        prev_page_id: Option<PageId>,
-        node_type: PageNodeType,
-        key_count: u16,
-        free_start: Offset,
-        free_end: Offset,
-        checksum: u32,
-    ) -> Self {
+    pub(crate) fn new(init: PageHeaderInit) -> Self {
         Self {
-            page_id,
-            parent_page_id,
-            next_page_id,
-            prev_page_id,
-            node_type,
-            key_count,
-            free_start,
-            free_end,
-            checksum,
+            page_id: init.page_id,
+            parent_page_id: init.parent_page_id,
+            next_page_id: init.next_page_id,
+            prev_page_id: init.prev_page_id,
+            node_type: init.node_type,
+            key_count: init.key_count,
+            free_start: init.free_start,
+            free_end: init.free_end,
+            checksum: init.checksum,
         }
     }
 }

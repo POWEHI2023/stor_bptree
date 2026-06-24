@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+use std::env;
 use std::ops::Range;
+
+use crate::bptree::page_types::PageHeaderInit;
 
 use super::error::{PageDecodeError, PageEncodeError, PageMutationError, PageRuntimeError};
 use super::page_types::{
-    Offset, Page, PageHeader, PageId, PageInterface, PageNodeType, RawPage, Slot,
+    Offset, Page, PageHeader, PageId, PageInfo, PageInterface, PageNodeType, RawPage, Slot,
 };
 use super::utils::{
     PAGE_CHECKSUM_OFFSET, PAGE_FREE_END_OFFSET, PAGE_FREE_START_OFFSET, PAGE_HEADER_SIZE,
@@ -11,21 +15,79 @@ use super::utils::{
     PAGE_PREV_PAGE_ID_OFFSET, PAGE_RESERVED_OFFSET, PAGE_SIZE, PAGE_VERSION, PAGE_VERSION_OFFSET,
     SLOT_CELL_LEN_OFFSET, SLOT_CELL_OFFSET_OFFSET, SLOT_SIZE,
 };
+// Used by page
 use super::utils::{
     checksum, decode_page_id, encode_page_id, read_u16, read_u32, read_u64, validate_layout,
     validate_slot, write_u16, write_u32, write_u64,
 };
+// Used by raw page
+use super::utils::{
+    ensure_dir, ensure_file, parse_yaml, read_to_string, resolve_project_path, validate_page_meta,
+};
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaConfig {
+    #[serde(rename = "GLOBAL_META_FILE")]
+    pub global_meta_file: String,
+    #[serde(rename = "PAGE_FILE_DIR")]
+    pub page_file_dir: String,
+}
 
 impl RawPage {
-    pub fn dump() -> Result<(), PageRuntimeError> {
+    pub fn load_meta() -> Result<(HashMap<PageId, PageInfo>, MetaConfig), PageRuntimeError> {
+        dotenvy::dotenv().ok();
+
+        let meta_file = env::var("METAFILE").map_err(|error| match error {
+            env::VarError::NotPresent => PageRuntimeError::MissingEnv { key: "METAFILE" },
+            env::VarError::NotUnicode(value) => PageRuntimeError::InvalidMeta {
+                page_id: None,
+                reason: format!("METAFILE is not valid unicode: {value:?}"),
+            },
+        })?;
+        let config_path = resolve_project_path(&meta_file)?;
+        let config_text = read_to_string(&config_path)?;
+        let config: MetaConfig = parse_yaml(&config_path, &config_text)?;
+
+        let global_meta_path = resolve_project_path(&config.global_meta_file)?;
+        let page_file_dir = resolve_project_path(&config.page_file_dir)?;
+        ensure_file(&global_meta_path)?;
+        ensure_dir(&page_file_dir)?;
+
+        let global_meta_text = read_to_string(&global_meta_path)?;
+        let page_meta: HashMap<PageId, PageInfo> =
+            parse_yaml(&global_meta_path, &global_meta_text)?;
+        validate_page_meta(&page_meta, &page_file_dir)?;
+
+        Ok((page_meta, config))
+    }
+
+    pub fn dump(
+        &self,
+        _page_meta: &HashMap<PageId, PageInfo>,
+        _config: &MetaConfig,
+        _page_id: Option<PageId>,
+    ) -> Result<(), PageRuntimeError> {
+        #[allow(unused)]
+        let page_id = if let Some(_page_id) = _page_id {
+            _page_id
+        } else {
+            read_u64(&self.bytes, PAGE_ID_OFFSET)
+        };
+
         todo!()
     }
 
-    pub fn load(_page_id: usize) -> Option<Self> {
+    pub fn load(
+        _page_meta: &HashMap<PageId, PageInfo>,
+        _config: &MetaConfig,
+        _page_id: PageId,
+    ) -> Option<Self> {
         todo!()
     }
 }
 
+/// Page implementation
 impl Page {
     pub fn decode(raw: &RawPage) -> Result<Self, PageDecodeError> {
         let magic = read_u32(&raw.bytes, PAGE_MAGIC_OFFSET);
@@ -79,18 +141,19 @@ impl Page {
             slot_offset += SLOT_SIZE;
         }
 
+        let page_head_init: PageHeaderInit = PageHeaderInit {
+            page_id,
+            parent_page_id,
+            next_page_id,
+            prev_page_id,
+            node_type,
+            key_count,
+            free_start,
+            free_end,
+            checksum: stored_checksum,
+        };
         Ok(Self {
-            header: PageHeader::new(
-                page_id,
-                parent_page_id,
-                next_page_id,
-                prev_page_id,
-                node_type,
-                key_count,
-                free_start,
-                free_end,
-                stored_checksum,
-            ),
+            header: PageHeader::new(page_head_init),
             data: raw.bytes.to_vec(),
             slots,
             left_most_child_page_id,
@@ -435,17 +498,17 @@ impl Page {
         left_most_child_page_id: Option<PageId>,
     ) -> Self {
         Self {
-            header: PageHeader::new(
+            header: PageHeader::new(PageHeaderInit {
                 page_id,
                 parent_page_id,
-                None,
-                None,
+                next_page_id: None,
+                prev_page_id: None,
                 node_type,
-                0,
-                PAGE_HEADER_SIZE as Offset,
-                PAGE_SIZE as Offset,
-                0,
-            ),
+                key_count: 0,
+                free_start: PAGE_HEADER_SIZE as Offset,
+                free_end: PAGE_SIZE as Offset,
+                checksum: 0,
+            }),
             data: vec![0; PAGE_SIZE],
             slots: Vec::new(),
             left_most_child_page_id,
