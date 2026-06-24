@@ -1,13 +1,34 @@
-use super::types::{Offset, PageId, Slot};
+use super::page_types::{Offset, PageId, Slot};
 
 pub const PAGE_SIZE: usize = 16 * 1024;
 pub const INVALID_PAGE_ID: PageId = 0;
-pub const PAGE_HEADER_SIZE: usize = 64;
-pub const SLOT_SIZE: usize = 4;
 
+/// Metadata related
 pub const PAGE_MAGIC: u32 = 0x4250_5452; // BPTR
 pub const PAGE_VERSION: u16 = 1;
-pub const CHECKSUM_OFFSET: usize = 54;
+
+/// PageHeader related
+pub const PAGE_HEADER_SIZE: usize = 64;
+pub const PAGE_MAGIC_OFFSET: usize = 0;
+pub const PAGE_VERSION_OFFSET: usize = 4;
+pub const PAGE_NODE_TYPE_OFFSET: usize = 6;
+pub const PAGE_RESERVED_OFFSET: usize = 7;
+pub const PAGE_ID_OFFSET: usize = 8;
+pub const PAGE_PARENT_PAGE_ID_OFFSET: usize = 16;
+pub const PAGE_NEXT_PAGE_ID_OFFSET: usize = 24;
+pub const PAGE_PREV_PAGE_ID_OFFSET: usize = 32;
+pub const PAGE_LEFT_MOST_CHILD_PAGE_ID_OFFSET: usize = 40;
+pub const PAGE_KEY_COUNT_OFFSET: usize = 48;
+pub const PAGE_FREE_START_OFFSET: usize = 50;
+pub const PAGE_FREE_END_OFFSET: usize = 52;
+pub const PAGE_CHECKSUM_OFFSET: usize = 54;
+
+/// Slot related
+pub const SLOT_SIZE: usize = 4;
+pub const SLOT_CELL_OFFSET_OFFSET: usize = 0;
+pub const SLOT_CELL_LEN_OFFSET: usize = 2;
+
+pub const CHECKSUM_OFFSET: usize = PAGE_CHECKSUM_OFFSET;
 
 pub fn encode_page_id(page_id: Option<PageId>) -> PageId {
     page_id.unwrap_or(INVALID_PAGE_ID)
@@ -67,7 +88,7 @@ pub fn checksum(bytes: &[u8; PAGE_SIZE]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
 
     for (index, byte) in bytes.iter().copied().enumerate() {
-        let value = if (CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4).contains(&index) {
+        let value = if (PAGE_CHECKSUM_OFFSET..PAGE_CHECKSUM_OFFSET + 4).contains(&index) {
             0
         } else {
             byte

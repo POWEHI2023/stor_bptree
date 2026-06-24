@@ -1,26 +1,45 @@
-use super::error::{PageDecodeError, PageEncodeError, PageMutationError};
-use super::types::{Offset, Page, PageHeader, PageId, PageNodeType, RawPage, Slot};
+use std::ops::Range;
+
+use super::error::{PageDecodeError, PageEncodeError, PageMutationError, PageRuntimeError};
+use super::page_types::{
+    Offset, Page, PageHeader, PageId, PageInterface, PageNodeType, RawPage, Slot,
+};
 use super::utils::{
-    CHECKSUM_OFFSET, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, PAGE_VERSION, SLOT_SIZE,
+    PAGE_CHECKSUM_OFFSET, PAGE_FREE_END_OFFSET, PAGE_FREE_START_OFFSET, PAGE_HEADER_SIZE,
+    PAGE_ID_OFFSET, PAGE_KEY_COUNT_OFFSET, PAGE_LEFT_MOST_CHILD_PAGE_ID_OFFSET, PAGE_MAGIC,
+    PAGE_MAGIC_OFFSET, PAGE_NEXT_PAGE_ID_OFFSET, PAGE_NODE_TYPE_OFFSET, PAGE_PARENT_PAGE_ID_OFFSET,
+    PAGE_PREV_PAGE_ID_OFFSET, PAGE_RESERVED_OFFSET, PAGE_SIZE, PAGE_VERSION, PAGE_VERSION_OFFSET,
+    SLOT_CELL_LEN_OFFSET, SLOT_CELL_OFFSET_OFFSET, SLOT_SIZE,
 };
 use super::utils::{
     checksum, decode_page_id, encode_page_id, read_u16, read_u32, read_u64, validate_layout,
     validate_slot, write_u16, write_u32, write_u64,
 };
 
+impl RawPage {
+    pub fn dump() -> Result<(), PageRuntimeError> {
+        todo!()
+    }
+
+    pub fn load(_page_id: usize) -> Option<Self> {
+        todo!()
+    }
+}
+
 impl Page {
     pub fn decode(raw: &RawPage) -> Result<Self, PageDecodeError> {
-        let magic = read_u32(&raw.bytes, 0);
+        let magic = read_u32(&raw.bytes, PAGE_MAGIC_OFFSET);
         if magic != PAGE_MAGIC {
             return Err(PageDecodeError::InvalidMagic(magic));
         }
 
-        let version = read_u16(&raw.bytes, 4);
+        let version = read_u16(&raw.bytes, PAGE_VERSION_OFFSET);
         if version != PAGE_VERSION {
             return Err(PageDecodeError::UnsupportedVersion(version));
         }
 
-        let stored_checksum = read_u32(&raw.bytes, CHECKSUM_OFFSET);
+        // checksum
+        let stored_checksum = read_u32(&raw.bytes, PAGE_CHECKSUM_OFFSET);
         let actual_checksum = checksum(&raw.bytes);
         if stored_checksum != actual_checksum {
             return Err(PageDecodeError::ChecksumMismatch {
@@ -29,15 +48,16 @@ impl Page {
             });
         }
 
-        let node_type = PageNodeType::from_u8(raw.bytes[6])?;
-        let page_id = read_u64(&raw.bytes, 8);
-        let parent_page_id = decode_page_id(read_u64(&raw.bytes, 16));
-        let next_page_id = decode_page_id(read_u64(&raw.bytes, 24));
-        let prev_page_id = decode_page_id(read_u64(&raw.bytes, 32));
-        let left_most_child_page_id = decode_page_id(read_u64(&raw.bytes, 40));
-        let key_count = read_u16(&raw.bytes, 48);
-        let free_start = read_u16(&raw.bytes, 50);
-        let free_end = read_u16(&raw.bytes, 52);
+        let node_type = PageNodeType::from_u8(raw.bytes[PAGE_NODE_TYPE_OFFSET])?;
+        let page_id = read_u64(&raw.bytes, PAGE_ID_OFFSET);
+        let parent_page_id = decode_page_id(read_u64(&raw.bytes, PAGE_PARENT_PAGE_ID_OFFSET));
+        let next_page_id = decode_page_id(read_u64(&raw.bytes, PAGE_NEXT_PAGE_ID_OFFSET));
+        let prev_page_id = decode_page_id(read_u64(&raw.bytes, PAGE_PREV_PAGE_ID_OFFSET));
+        let left_most_child_page_id =
+            decode_page_id(read_u64(&raw.bytes, PAGE_LEFT_MOST_CHILD_PAGE_ID_OFFSET));
+        let key_count = read_u16(&raw.bytes, PAGE_KEY_COUNT_OFFSET);
+        let free_start = read_u16(&raw.bytes, PAGE_FREE_START_OFFSET);
+        let free_end = read_u16(&raw.bytes, PAGE_FREE_END_OFFSET);
 
         validate_layout(key_count, free_start, free_end).map_err(PageDecodeError::InvalidLayout)?;
 
@@ -48,13 +68,15 @@ impl Page {
         }
 
         let mut slots = Vec::with_capacity(key_count as usize);
-        for index in 0..key_count as usize {
-            let slot_offset = PAGE_HEADER_SIZE + index * SLOT_SIZE;
-            let offset = read_u16(&raw.bytes, slot_offset);
-            let len = read_u16(&raw.bytes, slot_offset + 2);
+        let mut slot_offset = PAGE_HEADER_SIZE;
+        for _ in 0..key_count as usize {
+            let offset = read_u16(&raw.bytes, slot_offset + SLOT_CELL_OFFSET_OFFSET);
+            let len = read_u16(&raw.bytes, slot_offset + SLOT_CELL_LEN_OFFSET);
+            // TODO: validate slots overlap
             validate_slot(Slot { offset, len }, free_end)
                 .map_err(PageDecodeError::InvalidLayout)?;
             slots.push(Slot { offset, len });
+            slot_offset += SLOT_SIZE;
         }
 
         Ok(Self {
@@ -80,32 +102,49 @@ impl Page {
 
         let mut raw = RawPage::zeroed();
 
-        write_u32(&mut raw.bytes, 0, PAGE_MAGIC);
-        write_u16(&mut raw.bytes, 4, PAGE_VERSION);
-        raw.bytes[6] = self.header.node_type as u8;
-        raw.bytes[7] = 0;
-        write_u64(&mut raw.bytes, 8, self.header.page_id);
+        write_u32(&mut raw.bytes, PAGE_MAGIC_OFFSET, PAGE_MAGIC);
+        write_u16(&mut raw.bytes, PAGE_VERSION_OFFSET, PAGE_VERSION);
+        raw.bytes[PAGE_NODE_TYPE_OFFSET] = self.header.node_type as u8;
+        raw.bytes[PAGE_RESERVED_OFFSET] = 0;
+        write_u64(&mut raw.bytes, PAGE_ID_OFFSET, self.header.page_id);
         write_u64(
             &mut raw.bytes,
-            16,
+            PAGE_PARENT_PAGE_ID_OFFSET,
             encode_page_id(self.header.parent_page_id),
         );
-        write_u64(&mut raw.bytes, 24, encode_page_id(self.header.next_page_id));
-        write_u64(&mut raw.bytes, 32, encode_page_id(self.header.prev_page_id));
         write_u64(
             &mut raw.bytes,
-            40,
+            PAGE_NEXT_PAGE_ID_OFFSET,
+            encode_page_id(self.header.next_page_id),
+        );
+        write_u64(
+            &mut raw.bytes,
+            PAGE_PREV_PAGE_ID_OFFSET,
+            encode_page_id(self.header.prev_page_id),
+        );
+        write_u64(
+            &mut raw.bytes,
+            PAGE_LEFT_MOST_CHILD_PAGE_ID_OFFSET,
             encode_page_id(self.left_most_child_page_id),
         );
-        write_u16(&mut raw.bytes, 48, self.header.key_count);
-        write_u16(&mut raw.bytes, 50, self.header.free_start);
-        write_u16(&mut raw.bytes, 52, self.header.free_end);
-        write_u32(&mut raw.bytes, CHECKSUM_OFFSET, 0);
+        write_u16(&mut raw.bytes, PAGE_KEY_COUNT_OFFSET, self.header.key_count);
+        write_u16(
+            &mut raw.bytes,
+            PAGE_FREE_START_OFFSET,
+            self.header.free_start,
+        );
+        write_u16(&mut raw.bytes, PAGE_FREE_END_OFFSET, self.header.free_end);
+        write_u32(&mut raw.bytes, PAGE_CHECKSUM_OFFSET, 0);
 
-        for (index, slot) in self.slots.iter().enumerate() {
-            let slot_offset = PAGE_HEADER_SIZE + index * SLOT_SIZE;
-            write_u16(&mut raw.bytes, slot_offset, slot.offset);
-            write_u16(&mut raw.bytes, slot_offset + 2, slot.len);
+        let mut slot_offset = PAGE_HEADER_SIZE;
+        for slot in self.slots.iter() {
+            write_u16(
+                &mut raw.bytes,
+                slot_offset + SLOT_CELL_OFFSET_OFFSET,
+                slot.offset,
+            );
+            write_u16(&mut raw.bytes, slot_offset + SLOT_CELL_LEN_OFFSET, slot.len);
+            slot_offset += SLOT_SIZE;
 
             let start = slot.offset as usize;
             let end = start + slot.len as usize;
@@ -113,49 +152,38 @@ impl Page {
         }
 
         let checksum = checksum(&raw.bytes);
-        write_u32(&mut raw.bytes, CHECKSUM_OFFSET, checksum);
+        write_u32(&mut raw.bytes, PAGE_CHECKSUM_OFFSET, checksum);
 
         Ok(raw)
-    }
-
-    pub fn new_leaf(page_id: PageId, parent_page_id: Option<PageId>) -> Self {
-        Self::new(page_id, parent_page_id, PageNodeType::Leaf, None)
-    }
-
-    pub fn new_internal(page_id: PageId, parent_page_id: Option<PageId>) -> Self {
-        Self::new(page_id, parent_page_id, PageNodeType::Internal, None)
-    }
-
-    pub fn page_type(&self) -> PageNodeType {
-        self.header.node_type
     }
 
     pub fn free_space(&self) -> usize {
         (self.header.free_end - self.header.free_start) as usize
     }
 
-    pub fn set_parent_page_id(&mut self, parent_page_id: Option<PageId>) {
-        self.header.parent_page_id = parent_page_id;
-    }
-
-    pub fn set_leaf_links(&mut self, prev_page_id: Option<PageId>, next_page_id: Option<PageId>) {
-        self.header.prev_page_id = prev_page_id;
-        self.header.next_page_id = next_page_id;
-    }
-
-    pub fn set_left_most_child_page_id(&mut self, page_id: Option<PageId>) {
-        self.left_most_child_page_id = page_id;
-    }
-
-    /// Get bytes in slot
-    pub fn cell_bytes(&self, index: usize) -> Option<&[u8]> {
-        let slot = self.slots.get(index)?;
+    /// Get raw bytes in data
+    pub fn cell_bytes(&self, index: usize) -> Result<&[u8], PageRuntimeError> {
+        let slot = match self.slots.get(index) {
+            Some(slot) => slot,
+            None => {
+                return Err(PageRuntimeError::IndexOutOfBounds {
+                    index,
+                    len: self.slots.len(),
+                });
+            }
+        };
         let start = slot.offset as usize;
         let end = start + slot.len as usize;
-        self.data.get(start..end)
+        match self.data.get(start..end) {
+            Some(data) => Ok(data),
+            None => Err(PageRuntimeError::VisitDataFailed {
+                offset: start,
+                len: slot.len as usize,
+            }),
+        }
     }
 
-    /// Insert bytes in slot
+    /// Insert raw bytes in data
     pub fn insert_cell_bytes(
         &mut self,
         index: usize,
@@ -172,6 +200,7 @@ impl Page {
             return Err(PageMutationError::EmptyCell);
         }
 
+        // calculate position
         let cell_len = u16::try_from(cell.len())
             .map_err(|_| PageMutationError::CellTooLarge { len: cell.len() })?;
         let needed = SLOT_SIZE + cell.len();
@@ -188,6 +217,7 @@ impl Page {
             .checked_sub(cell_len)
             .ok_or(PageMutationError::CellTooLarge { len: cell.len() })?;
 
+        // insert into slots
         let start = new_offset as usize;
         let end = start + cell.len();
         self.data[start..end].copy_from_slice(cell);
@@ -198,6 +228,8 @@ impl Page {
                 len: cell_len,
             },
         );
+
+        // update metadata
         self.header.key_count = self.slots.len() as u16;
         self.header.free_start = (PAGE_HEADER_SIZE + self.slots.len() * SLOT_SIZE) as Offset;
         self.header.free_end = new_offset;
@@ -205,7 +237,197 @@ impl Page {
         Ok(())
     }
 
+    pub fn erase_cell_bytes(&mut self, index: usize) -> Result<Vec<u8>, PageMutationError> {
+        let slot = match self.slots.get(index) {
+            Some(_ret) => Ok(_ret),
+            None => Err(PageMutationError::IndexOutOfBounds {
+                index,
+                len: self.slots.len(),
+            }),
+        }?;
+
+        let (start, len) = (slot.offset as usize, slot.len as usize);
+        let end = start + len;
+        if end > self.data.len() {
+            return Err(PageMutationError::InvalidDataRange {
+                range: (start, end),
+                size: self.data.len(),
+            });
+        }
+
+        let r = self.data[start..end].to_vec();
+        let free_end = self.header.free_end as usize;
+        self.data.copy_within(free_end..start, free_end + len);
+        self.data[free_end..free_end + len].fill(0);
+
+        self.slots.remove(index);
+        for slot in self.slots.iter_mut() {
+            if (slot.offset as usize) < start {
+                slot.offset += len as u16;
+            }
+        }
+
+        self.header.key_count = self.slots.len() as u16;
+        self.header.free_start = (PAGE_HEADER_SIZE + self.slots.len() * SLOT_SIZE) as Offset;
+        self.header.free_end += len as u16;
+
+        Ok(r)
+    }
+
+    pub fn range_cell_bytes(
+        &self,
+        r: Range<usize>,
+    ) -> Result<(Vec<&[u8]>, Vec<Slot>), PageRuntimeError> {
+        let (mut data, mut slots) = (vec![], vec![]);
+
+        for index in r {
+            let slot = match self.slots.get(index) {
+                Some(slot) => slot,
+                None => {
+                    return Err(PageRuntimeError::IndexOutOfBounds {
+                        index,
+                        len: self.slots.len(),
+                    });
+                }
+            };
+
+            slots.push(*slot);
+            let (start, len) = (slot.offset as usize, slot.len as usize);
+            let end = start + len;
+
+            match self.data.get(start..end) {
+                Some(d) => data.push(d),
+                None => {
+                    return Err(PageRuntimeError::VisitDataFailed {
+                        offset: start,
+                        len: slot.len as usize,
+                    });
+                }
+            }
+        }
+
+        Ok((data, slots))
+    }
+
+    /// TODO: Use more efficient way to erase range
+    pub fn erase_range_cell_bytes(
+        &mut self,
+        r: Range<usize>,
+    ) -> Result<(Vec<Vec<u8>>, Vec<Slot>), PageMutationError> {
+        if r.start > r.end || r.end > self.slots.len() {
+            let index = if r.start > r.end { r.start } else { r.end };
+            return Err(PageMutationError::IndexOutOfBounds {
+                index,
+                len: self.slots.len(),
+            });
+        }
+
+        let mut erased_cells = Vec::with_capacity(r.end - r.start);
+        let mut erased_slots = Vec::with_capacity(r.end - r.start);
+        for index in r.clone() {
+            let slot = self.slots[index];
+            let start = slot.offset as usize;
+            let end = start + slot.len as usize;
+            let cell = self
+                .data
+                .get(start..end)
+                .ok_or(PageMutationError::InvalidDataRange {
+                    range: (start, end),
+                    size: self.data.len(),
+                })?;
+            erased_cells.push(cell.to_vec());
+            erased_slots.push(slot);
+        }
+
+        for index in r.rev() {
+            self.erase_cell_bytes(index)?;
+        }
+
+        Ok((erased_cells, erased_slots))
+    }
+}
+
+impl PageInterface for Page {
+    fn decode(raw: &RawPage) -> Result<Self, PageDecodeError> {
+        Page::decode(raw)
+    }
+    fn encode(&self) -> Result<RawPage, PageEncodeError> {
+        Page::encode(self)
+    }
+
+    fn slots(&self) -> &[Slot] {
+        &self.slots
+    }
+
+    fn set_parent_page_id(&mut self, parent_page_id: Option<PageId>) {
+        self.header.parent_page_id = parent_page_id;
+    }
+    fn set_prev_page_id(&mut self, prev_page_id: Option<PageId>) {
+        self.header.prev_page_id = prev_page_id;
+    }
+    fn set_next_page_id(&mut self, next_page_id: Option<PageId>) {
+        self.header.next_page_id = next_page_id;
+    }
+    fn set_left_most_child_page_id(&mut self, left_most_child_page_id: Option<PageId>) {
+        self.left_most_child_page_id = left_most_child_page_id;
+    }
+
+    fn page_id(&self) -> PageId {
+        self.header.page_id
+    }
+    fn parent_page_id(&self) -> Option<PageId> {
+        self.header.parent_page_id
+    }
+    fn prev_page_id(&self) -> Option<PageId> {
+        self.header.prev_page_id
+    }
+    fn next_page_id(&self) -> Option<PageId> {
+        self.header.next_page_id
+    }
+    fn left_most_child_page_id(&self) -> Option<PageId> {
+        self.left_most_child_page_id
+    }
+
+    fn node_type(&self) -> PageNodeType {
+        self.header.node_type
+    }
+    fn key_count(&self) -> usize {
+        self.header.key_count as usize
+    }
+    fn free_space(&self) -> usize {
+        Page::free_space(self)
+    }
+
+    fn cell_bytes(&self, index: usize) -> Result<&[u8], PageRuntimeError> {
+        Page::cell_bytes(self, index)
+    }
+
+    fn range_cell_bytes(
+        &self,
+        range: Range<usize>,
+    ) -> Result<(Vec<&[u8]>, Vec<Slot>), PageRuntimeError> {
+        Page::range_cell_bytes(self, range)
+    }
+
+    fn insert_cell_bytes(&mut self, index: usize, cell: &[u8]) -> Result<(), PageMutationError> {
+        Page::insert_cell_bytes(self, index, cell)
+    }
+
+    fn erase_cell_bytes(&mut self, index: usize) -> Result<Vec<u8>, PageMutationError> {
+        Page::erase_cell_bytes(self, index)
+    }
+
+    fn erase_range_cell_bytes(
+        &mut self,
+        range: Range<usize>,
+    ) -> Result<(Vec<Vec<u8>>, Vec<Slot>), PageMutationError> {
+        Page::erase_range_cell_bytes(self, range)
+    }
+}
+
+impl Page {
     /// create a new page node
+    #[allow(dead_code)]
     fn new(
         page_id: PageId,
         parent_page_id: Option<PageId>,

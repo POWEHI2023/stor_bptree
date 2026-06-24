@@ -1,4 +1,10 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageRuntimeError {
+    IndexOutOfBounds { index: usize, len: usize },
+    VisitDataFailed { offset: usize, len: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageDecodeError {
     InvalidMagic(u32),
     UnsupportedVersion(u16),
@@ -18,7 +24,26 @@ pub enum PageMutationError {
     CellTooLarge { len: usize },
     NotEnoughSpace { needed: usize, available: usize },
     IndexOutOfBounds { index: usize, len: usize },
+    InvalidDataRange { range: (usize, usize), size: usize },
 }
+
+impl std::fmt::Display for PageRuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfBounds { index, len } => {
+                write!(f, "cell index {index} is out of bounds for length {len}")
+            }
+            Self::VisitDataFailed { offset, len } => {
+                write!(
+                    f,
+                    "visit data failed, got `None` but not `&[u8]`, offset {offset}, len is {len}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PageRuntimeError {}
 
 impl std::fmt::Display for PageDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,6 +85,9 @@ impl std::fmt::Display for PageMutationError {
             ),
             Self::IndexOutOfBounds { index, len } => {
                 write!(f, "cell index {index} is out of bounds for length {len}")
+            }
+            Self::InvalidDataRange { range, size } => {
+                write!(f, "invalid data range {range:?}, data size is {size}")
             }
         }
     }
