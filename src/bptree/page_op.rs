@@ -62,7 +62,8 @@ impl RawPage {
         Ok((page_meta, config))
     }
 
-    pub fn dump(
+    /// Write bytes in file block
+    pub async fn dump(
         &self,
         _page_meta: &HashMap<PageId, PageInfo>,
         _config: &MetaConfig,
@@ -78,11 +79,12 @@ impl RawPage {
         todo!()
     }
 
-    pub fn load(
+    /// Read bytes from file block
+    pub async fn load(
         _page_meta: &HashMap<PageId, PageInfo>,
         _config: &MetaConfig,
         _page_id: PageId,
-    ) -> Option<Self> {
+    ) -> Result<Self, PageRuntimeError> {
         todo!()
     }
 }
