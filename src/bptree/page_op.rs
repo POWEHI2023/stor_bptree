@@ -37,6 +37,7 @@ pub struct MetaConfig {
 impl RawPage {
     pub fn load_meta() -> Result<(HashMap<PageId, PageInfo>, MetaConfig), PageRuntimeError> {
         dotenvy::dotenv().ok();
+        crate::logger::init();
 
         let meta_file = env::var("METAFILE").map_err(|error| match error {
             env::VarError::NotPresent => PageRuntimeError::MissingEnv { key: "METAFILE" },
@@ -46,17 +47,25 @@ impl RawPage {
             },
         })?;
         let config_path = resolve_project_path(&meta_file)?;
+        tracing::info!(?config_path, "yaml config path");
+
         let config_text = read_to_string(&config_path)?;
         let config: MetaConfig = parse_yaml(&config_path, &config_text)?;
+        tracing::info!(?config, "yaml config");
 
+        // global meta file records infomation about data files and blocks
         let global_meta_path = resolve_project_path(&config.global_meta_file)?;
         let page_file_dir = resolve_project_path(&config.page_file_dir)?;
         ensure_file(&global_meta_path)?;
         ensure_dir(&page_file_dir)?;
+        tracing::info!(?global_meta_path, "global meta file");
+        tracing::info!(?page_file_dir, "page files directory");
 
         let global_meta_text = read_to_string(&global_meta_path)?;
         let page_meta: HashMap<PageId, PageInfo> =
             parse_yaml(&global_meta_path, &global_meta_text)?;
+        tracing::info!(?page_meta, "page metadata");
+
         validate_page_meta(&page_meta, &page_file_dir)?;
 
         Ok((page_meta, config))
@@ -87,7 +96,108 @@ impl RawPage {
         _config: &MetaConfig,
         _page_id: PageId,
     ) -> Result<Self, PageRuntimeError> {
-        todo!()
+        use std::ffi::c_void;
+        use std::fs::File;
+        use std::os::fd::AsRawFd;
+        use std::ptr;
+
+        const PROT_READ: i32 = 0x1;
+        const MAP_PRIVATE: i32 = 0x02;
+        const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
+
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut c_void;
+            fn munmap(addr: *mut c_void, len: usize) -> i32;
+        }
+
+        let page_info =
+            _page_meta
+                .get(&_page_id)
+                .ok_or_else(|| PageRuntimeError::FileDoNotExist {
+                    file_id: _page_id as usize,
+                })?;
+        if page_info.page_size != PAGE_SIZE {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(_page_id),
+                reason: format!("page_size must be {PAGE_SIZE}, got {}", page_info.page_size),
+            });
+        }
+
+        let page_file_dir = resolve_project_path(&_config.page_file_dir)?;
+        let page_file_path = page_file_dir.join(&page_info.file_name);
+        let file = File::open(&page_file_path).map_err(|error| PageRuntimeError::Io {
+            path: page_file_path.display().to_string(),
+            source: error.to_string(),
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|error| PageRuntimeError::Io {
+                path: page_file_path.display().to_string(),
+                source: error.to_string(),
+            })?
+            .len();
+        let page_end = page_info
+            .offset
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or_else(|| PageRuntimeError::InvalidMeta {
+                page_id: Some(_page_id),
+                reason: format!(
+                    "offset {} plus page size {PAGE_SIZE} overflows",
+                    page_info.offset
+                ),
+            })?;
+        if page_end > file_len {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(_page_id),
+                reason: format!(
+                    "range {}..{} exceeds file size {}",
+                    page_info.offset, page_end, file_len
+                ),
+            });
+        }
+        let mmap_offset =
+            i64::try_from(page_info.offset).map_err(|_| PageRuntimeError::InvalidMeta {
+                page_id: Some(_page_id),
+                reason: format!("offset {} exceeds mmap offset range", page_info.offset),
+            })?;
+
+        let mapped = unsafe {
+            mmap(
+                ptr::null_mut(),
+                PAGE_SIZE,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                mmap_offset,
+            )
+        };
+        if mapped == MAP_FAILED {
+            return Err(PageRuntimeError::Io {
+                path: page_file_path.display().to_string(),
+                source: std::io::Error::last_os_error().to_string(),
+            });
+        }
+
+        let mut bytes = [0; PAGE_SIZE];
+        unsafe {
+            let mapped_bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), PAGE_SIZE);
+            bytes.copy_from_slice(mapped_bytes);
+            if munmap(mapped, PAGE_SIZE) != 0 {
+                return Err(PageRuntimeError::Io {
+                    path: page_file_path.display().to_string(),
+                    source: std::io::Error::last_os_error().to_string(),
+                });
+            }
+        }
+
+        Ok(Self { bytes })
     }
 }
 

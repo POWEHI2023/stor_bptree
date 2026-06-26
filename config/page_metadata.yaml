@@ -1,0 +1,8 @@
+1:
+  file_name: "pages.dat"
+  offset: 0
+  page_size: 16384
+2:
+  file_name: "pages.dat"
+  offset: 16384
+  page_size: 16384

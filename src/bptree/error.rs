@@ -27,6 +27,13 @@ pub enum PageRuntimeError {
         offset: usize,
         len: usize,
     },
+    FileDoNotExist {
+        file_id: usize,
+    },
+    FileOutOfBound {
+        file: String,
+        offset: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +78,12 @@ impl std::fmt::Display for PageRuntimeError {
                     f,
                     "visit data failed, got `None` but not `&[u8]`, offset {offset}, len is {len}"
                 )
+            }
+            Self::FileDoNotExist { file_id } => {
+                write!(f, "file id {file_id} do not exist.")
+            }
+            Self::FileOutOfBound { file, offset } => {
+                write!(f, "offset {offset} out of bound of file {file}.")
             }
         }
     }
