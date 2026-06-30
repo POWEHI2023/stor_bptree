@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::env;
 use std::ops::Range;
-
-use crate::bptree::page_types::PageHeaderInit;
+use std::path::PathBuf;
 
 use super::error::{PageDecodeError, PageEncodeError, PageMutationError, PageRuntimeError};
 use super::page_types::{
-    Offset, Page, PageHeader, PageId, PageInfo, PageInterface, PageNodeType, RawPage, Slot,
+    MetaConfig, Offset, Page, PageHeader, PageHeaderInit, PageId, PageInfo, PageInterface,
+    PageNodeType, RawPage, RawPageBytes, Slot,
 };
 use super::utils::{
     PAGE_CHECKSUM_OFFSET, PAGE_FREE_END_OFFSET, PAGE_FREE_START_OFFSET, PAGE_HEADER_SIZE,
@@ -25,16 +25,14 @@ use super::utils::{
     ensure_dir, ensure_file, parse_yaml, read_to_string, resolve_project_path, validate_page_meta,
 };
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MetaConfig {
-    #[serde(rename = "GLOBAL_META_FILE")]
-    pub global_meta_file: String,
-    #[serde(rename = "PAGE_FILE_DIR")]
-    pub page_file_dir: String,
-}
-
 impl RawPage {
+    /// How to use RawPage?
+    /// 1. load_meta while the system boosts, store the HashMap and MetaConfig as the context.
+    /// 2. call RawPage::load(ctx.page_meta, ctx.config, page_id) to load a RawPage from file.
+    /// 3. let _page = RawPage::loca(...), then _page.flush() while in case of necessary.
+    /// 4. _page.dump() while unmap() in final
+    /// 5. default drop just unmap but not flushing memory into disk.
+
     pub fn load_meta() -> Result<(HashMap<PageId, PageInfo>, MetaConfig), PageRuntimeError> {
         dotenvy::dotenv().ok();
         crate::logger::init();
@@ -71,51 +69,113 @@ impl RawPage {
         Ok((page_meta, config))
     }
 
-    /// Write bytes in file block
+    /// Flush bytes in memory to disk
+    pub async fn flush(
+        &mut self,
+        _page_meta: &HashMap<PageId, PageInfo>,
+        _config: &MetaConfig,
+        _page_id: Option<PageId>,
+    ) -> Result<PathBuf, PageRuntimeError> {
+        use std::fs;
+
+        let current_page_id = read_u64(&self.bytes, PAGE_ID_OFFSET);
+        let page_id = if let Some(page_id) = _page_id {
+            if page_id != current_page_id {
+                return Err(PageRuntimeError::InvalidMeta {
+                    page_id: Some(page_id),
+                    reason: format!("raw page id {current_page_id} does not match {page_id}"),
+                });
+            }
+            page_id
+        } else {
+            current_page_id
+        };
+
+        let page_info =
+            _page_meta
+                .get(&page_id)
+                .ok_or_else(|| PageRuntimeError::FileDoNotExist {
+                    file_id: page_id as usize,
+                })?;
+        if page_info.page_size != PAGE_SIZE {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(page_id),
+                reason: format!("page_size must be {PAGE_SIZE}, got {}", page_info.page_size),
+            });
+        }
+
+        let page_file_dir = resolve_project_path(&_config.page_file_dir)?;
+        let page_file_path = page_file_dir.join(&page_info.file_name);
+        let file_len = fs::metadata(&page_file_path)
+            .map_err(|error| PageRuntimeError::Io {
+                path: page_file_path.display().to_string(),
+                source: error.to_string(),
+            })?
+            .len();
+        let page_end = page_info
+            .offset
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or_else(|| PageRuntimeError::InvalidMeta {
+                page_id: Some(page_id),
+                reason: format!(
+                    "offset {} plus page size {PAGE_SIZE} overflows",
+                    page_info.offset
+                ),
+            })?;
+        if page_end > file_len {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(page_id),
+                reason: format!(
+                    "range {}..{} exceeds file size {}",
+                    page_info.offset, page_end, file_len
+                ),
+            });
+        }
+
+        if !self.bytes.is_mapped_to(&page_file_path, page_info.offset) {
+            return Err(PageRuntimeError::InvalidMeta {
+                page_id: Some(page_id),
+                reason: format!(
+                    "raw page is not mapped to {} at offset {}",
+                    page_file_path.display(),
+                    page_info.offset
+                ),
+            });
+        }
+
+        self.bytes.flush().map_err(|error| PageRuntimeError::Io {
+            path: page_file_path.display().to_string(),
+            source: error.to_string(),
+        })?;
+
+        Ok(page_file_path)
+    }
+
+    /// Flush then unmap memory and drop the pointer
     pub async fn dump(
-        &self,
+        &mut self,
         _page_meta: &HashMap<PageId, PageInfo>,
         _config: &MetaConfig,
         _page_id: Option<PageId>,
     ) -> Result<(), PageRuntimeError> {
-        #[allow(unused)]
-        let page_id = if let Some(_page_id) = _page_id {
-            _page_id
-        } else {
-            read_u64(&self.bytes, PAGE_ID_OFFSET)
-        };
+        let page_file_path = self.flush(_page_meta, _config, _page_id).await?;
 
-        // TODO: Create a new file block and add meta info
-        // if there is no _page_id found in _page_meta.
-        todo!()
+        self.bytes.unmap().map_err(|error| PageRuntimeError::Io {
+            path: page_file_path.display().to_string(),
+            source: error.to_string(),
+        })?;
+
+        Ok(())
     }
 
-    /// Read bytes from file block
+    /// Read bytes from disk
+    /// Mmap file block to memory
     pub async fn load(
         _page_meta: &HashMap<PageId, PageInfo>,
         _config: &MetaConfig,
         _page_id: PageId,
     ) -> Result<Self, PageRuntimeError> {
-        use std::ffi::c_void;
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-        use std::ptr;
-
-        const PROT_READ: i32 = 0x1;
-        const MAP_PRIVATE: i32 = 0x02;
-        const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
-
-        unsafe extern "C" {
-            fn mmap(
-                addr: *mut c_void,
-                len: usize,
-                prot: i32,
-                flags: i32,
-                fd: i32,
-                offset: i64,
-            ) -> *mut c_void;
-            fn munmap(addr: *mut c_void, len: usize) -> i32;
-        }
+        use std::fs::OpenOptions;
 
         let page_info =
             _page_meta
@@ -132,10 +192,14 @@ impl RawPage {
 
         let page_file_dir = resolve_project_path(&_config.page_file_dir)?;
         let page_file_path = page_file_dir.join(&page_info.file_name);
-        let file = File::open(&page_file_path).map_err(|error| PageRuntimeError::Io {
-            path: page_file_path.display().to_string(),
-            source: error.to_string(),
-        })?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&page_file_path)
+            .map_err(|error| PageRuntimeError::Io {
+                path: page_file_path.display().to_string(),
+                source: error.to_string(),
+            })?;
         let file_len = file
             .metadata()
             .map_err(|error| PageRuntimeError::Io {
@@ -162,42 +226,23 @@ impl RawPage {
                 ),
             });
         }
-        let mmap_offset =
-            i64::try_from(page_info.offset).map_err(|_| PageRuntimeError::InvalidMeta {
-                page_id: Some(_page_id),
-                reason: format!("offset {} exceeds mmap offset range", page_info.offset),
-            })?;
 
-        let mapped = unsafe {
-            mmap(
-                ptr::null_mut(),
-                PAGE_SIZE,
-                PROT_READ,
-                MAP_PRIVATE,
-                file.as_raw_fd(),
-                mmap_offset,
-            )
-        };
-        if mapped == MAP_FAILED {
-            return Err(PageRuntimeError::Io {
-                path: page_file_path.display().to_string(),
-                source: std::io::Error::last_os_error().to_string(),
-            });
-        }
-
-        let mut bytes = [0; PAGE_SIZE];
-        unsafe {
-            let mapped_bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), PAGE_SIZE);
-            bytes.copy_from_slice(mapped_bytes);
-            if munmap(mapped, PAGE_SIZE) != 0 {
-                return Err(PageRuntimeError::Io {
+        Ok(Self {
+            bytes: RawPageBytes::map_file(&file, page_file_path.clone(), page_info.offset)
+                .map_err(|error| PageRuntimeError::Io {
                     path: page_file_path.display().to_string(),
-                    source: std::io::Error::last_os_error().to_string(),
-                });
-            }
-        }
+                    source: error.to_string(),
+                })?,
+        })
+    }
+}
 
-        Ok(Self { bytes })
+impl Drop for RawPage {
+    fn drop(&mut self) -> () {
+        let _ = self.bytes.unmap().map_err(|error| PageRuntimeError::Io {
+            path: String::new(),
+            source: error.to_string(),
+        });
     }
 }
 
